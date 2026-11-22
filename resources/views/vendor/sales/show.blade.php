@@ -114,8 +114,8 @@
                 </div>
             @endif
         </div>
-            {{-- Cancel Button (only show for non-completed, non-cancelled orders, and when no dispute is active) --}}
-            @if($sale->status !== 'completed' && $sale->status !== 'cancelled' && !$sale->dispute)
+            {{-- Cancel Button (only while the vendor may still cancel; never during a dispute) --}}
+            @if($sale->canBeCancelledBy(auth()->id()))
                 <div class="orders-show-actions">
                     <form action="{{ route('orders.mark-cancelled', $sale->unique_url) }}" method="POST">
                         @csrf

@@ -87,9 +87,6 @@ class VendorController extends Controller
      */
     public function showSale($uniqueUrl)
     {
-        // Process any orders that need auto status changes
-        Orders::processAllAutoStatusChanges();
-        
         $sale = Orders::findByUrl($uniqueUrl);
         
         if (!$sale) {

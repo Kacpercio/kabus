@@ -13,6 +13,8 @@ return [
     'host' => env('MONERO_RPC_HOST', '127.0.0.1'),
     'port' => env('MONERO_RPC_PORT', 18082),
     'ssl' => env('MONERO_RPC_SSL', false),
+    'user' => env('MONERO_RPC_USER'),
+    'password' => env('MONERO_RPC_PASSWORD'),
 
     /*
     |--------------------------------------------------------------------------
@@ -84,4 +86,30 @@ return [
     |
     */
     'cancelled_order_commission_percentage' => env('MONERO_CANCELLED_ORDER_COMMISSION_PERCENTAGE', 1.0),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Escrow Settings
+    |--------------------------------------------------------------------------
+    |
+    | - order_min_confirmations: Confirmations an incoming payment needs before
+    |   it counts towards an order. Mempool and less-confirmed payments are shown
+    |   as "unconfirmed" and keep the order from expiring, but never mark it paid.
+    | - late_payment_window_hours: How long after an order is finished (or its
+    |   payment window expired) its address is still watched, so that late or
+    |   extra payments are refunded instead of lost.
+    | - refund_dust_threshold: Uncovered funds below this amount (XMR) are not
+    |   refunded, because the network fee would eat them.
+    | - payout_fee_reserve: Unlocked balance (XMR) kept on top of a transfer's
+    |   amount to pay its network fee. Transfers wait until it is available;
+    |   they are never sent partially.
+    | - transfer_lock_seconds: How long one worker holds a transfer while it is
+    |   being sent.
+    |
+    */
+    'order_min_confirmations' => (int) env('MONERO_ORDER_MIN_CONFIRMATIONS', 10),
+    'late_payment_window_hours' => (int) env('MONERO_LATE_PAYMENT_WINDOW_HOURS', 168),
+    'refund_dust_threshold' => env('MONERO_REFUND_DUST_THRESHOLD', '0.0005'),
+    'payout_fee_reserve' => env('MONERO_PAYOUT_FEE_RESERVE', '0.01'),
+    'transfer_lock_seconds' => (int) env('MONERO_TRANSFER_LOCK_SECONDS', 120),
 ];

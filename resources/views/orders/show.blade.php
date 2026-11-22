@@ -122,13 +122,6 @@
                         </span>
                     </div>
                 
-                    <div class="orders-show-payment-row">
-                        <span class="orders-show-payment-label">Minimum Payment:</span>
-                        <span class="orders-show-payment-value">
-                            <span class="orders-show-payment-amount">ɱ{{ number_format($order->required_xmr_amount * 0.1, 12) }} XMR (10%)</span>
-                        </span>
-                    </div>
-                
                     @if($order->total_received_xmr > 0 && !$order->is_paid)
                         <div class="orders-show-payment-row">
                             <span class="orders-show-payment-label">Amount Received:</span>
@@ -138,6 +131,16 @@
                                     Remaining: ɱ{{ number_format($order->required_xmr_amount - $order->total_received_xmr, 12) }} XMR
                                 </span>
                             </div>
+                        </div>
+                    @endif
+
+                    @if($order->unconfirmed_received_xmr > 0 && !$order->is_paid)
+                        <div class="orders-show-payment-row">
+                            <span class="orders-show-payment-label">Unconfirmed:</span>
+                            <span class="orders-show-payment-value">
+                                <span class="orders-show-payment-amount">ɱ{{ number_format($order->unconfirmed_received_xmr, 12) }} XMR</span>
+                                (counts after {{ config('monero.order_min_confirmations') }} confirmations)
+                            </span>
                         </div>
                     @endif
                 
@@ -163,7 +166,7 @@
             
                 @if($order->expires_at)
                     <div class="orders-show-payment-expiry">
-                        <p>The payment window expires in {{ $order->expires_at->diffForHumans() }}. Your order will be automatically canceled if the required amount of Monero for the purchase hasn't been met, and any incomplete amount will not be returned to your address after automatic cancellation.</p>
+                        <p>The payment window expires in {{ $order->expires_at->diffForHumans() }}. Your order will be automatically canceled if the required amount of Monero for the purchase hasn't been met. Payments that are still waiting for confirmations keep the order open until they confirm. Any incomplete amount is refunded to one of your return addresses, minus the cancellation fee.</p>
                     </div>
 
                     <div class="orders-show-payment-disclaimer">
@@ -239,7 +242,7 @@
     </div>
 
     {{-- Cancel Button Section (new location) --}}
-    @if($isBuyer && ($order->status === 'waiting_payment' || $order->status === 'payment_received' || $order->status === 'product_sent'))
+    @if($isBuyer && $order->canBeCancelledBy(auth()->id()))
     <div class="orders-show-cancel-container">
         <form action="{{ route('orders.mark-cancelled', $order->unique_url) }}" method="POST">
             @csrf

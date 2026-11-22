@@ -2,8 +2,12 @@
 
 namespace App\Models;
 
+use App\Services\Monero\MoneroWallet;
+use App\Support\Xmr;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class Orders extends Model
@@ -57,7 +61,9 @@ class Orders extends Model
         'vendor_payment_at',
         'buyer_refund_amount',
         'buyer_refund_address',
-        'buyer_refund_at'
+        'buyer_refund_at',
+        'unconfirmed_received_xmr',
+        'cancelled_at'
     ];
 
     /**
@@ -73,6 +79,7 @@ class Orders extends Model
         'total_received_xmr' => 'decimal:12',
         'vendor_payment_amount' => 'decimal:12',
         'buyer_refund_amount' => 'decimal:12',
+        'unconfirmed_received_xmr' => 'decimal:12',
         'xmr_usd_rate' => 'decimal:2',
         'is_paid' => 'boolean',
         'is_sent' => 'boolean',
@@ -86,6 +93,7 @@ class Orders extends Model
         'payment_completed_at' => 'datetime',
         'vendor_payment_at' => 'datetime',
         'buyer_refund_at' => 'datetime',
+        'cancelled_at' => 'datetime',
     ];
 
     /**
@@ -154,85 +162,137 @@ class Orders extends Model
     }
 
     /**
-     * Generate a Monero subaddress for the order payment.
-     * 
-     * @param \MoneroIntegrations\MoneroPhp\walletRPC $walletRPC
-     * @return bool
+     * Get the escrow transfers (vendor payouts and buyer refunds) of this order.
      */
-    public function generatePaymentAddress($walletRPC)
+    public function escrowTransfers()
+    {
+        return $this->hasMany(EscrowTransfer::class, 'order_id');
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Locking
+    |--------------------------------------------------------------------------
+    |
+    | Every status change runs on a freshly loaded copy of the order that is
+    | locked with SELECT ... FOR UPDATE inside a transaction. Two concurrent
+    | requests (double click, buyer and vendor at once, the scheduler and a
+    | page view) therefore see each other's result instead of both acting on a
+    | stale status.
+    |
+    */
+
+    /**
+     * Run $callback with a row-locked copy of this order inside a transaction,
+     * then refresh this instance.
+     */
+    public function withLock(callable $callback)
+    {
+        $result = DB::transaction(function () use ($callback) {
+            $locked = static::whereKey($this->getKey())->lockForUpdate()->firstOrFail();
+
+            return $callback($locked);
+        });
+
+        $this->refresh();
+
+        return $result;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Incoming payments
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * Generate a Monero subaddress for the order payment and fix the XMR price.
+     *
+     * @param  string|float  $xmrUsdRate
+     */
+    public function generatePaymentAddress(MoneroWallet $wallet, $xmrUsdRate): bool
     {
         try {
-            // Only generate an address if none exists
-            if (empty($this->payment_address)) {
-                $result = $walletRPC->create_address(0, "Order Payment " . $this->id);
-                
-                $this->payment_address = $result['address'];
-                $this->payment_address_index = $result['address_index'];
-                $this->expires_at = now()->addMinutes((int) config('monero.address_expiration_time', 1440));
-                $this->save();
-            }
-            
-            return true;
+            return $this->withLock(function (Orders $order) use ($wallet, $xmrUsdRate) {
+                if (!empty($order->payment_address)) {
+                    return true;
+                }
+
+                if ($order->status !== self::STATUS_WAITING_PAYMENT) {
+                    return false;
+                }
+
+                $order->required_xmr_amount = $order->calculateRequiredXmrAmount($xmrUsdRate);
+                $order->xmr_usd_rate = $xmrUsdRate;
+
+                $subaddress = $wallet->createSubaddress('Order Payment ' . $order->id);
+                $order->payment_address = $subaddress['address'];
+                $order->payment_address_index = $subaddress['index'];
+                $order->expires_at = now()->addMinutes((int) config('monero.address_expiration_time', 1440));
+                $order->save();
+
+                return true;
+            });
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('Failed to generate payment address: ' . $e->getMessage());
+            Log::error('Failed to generate payment address: ' . $e->getMessage());
+
             return false;
         }
     }
 
     /**
-     * Check for and process new payments.
-     * 
-     * @param \MoneroIntegrations\MoneroPhp\walletRPC $walletRPC
-     * @return bool
+     * Read incoming payments for this order from the wallet and update the
+     * order.
+     *
+     * Only payments with enough confirmations count towards the order; the rest
+     * is stored as unconfirmed. Every confirmed payment counts, whatever its
+     * size: small payments used to be ignored and were then never refunded.
+     *
+     * Funds that arrive after the order is finished (completed or cancelled)
+     * are refunded to the buyer.
      */
-    public function checkPayments($walletRPC)
+    public function checkPayments(MoneroWallet $wallet): bool
     {
-        if ($this->is_paid || $this->status !== self::STATUS_WAITING_PAYMENT) {
+        if ($this->payment_address_index === null || empty($this->payment_address)) {
             return false;
         }
 
-        try {
-            // Check for new payments
-            $transfers = $walletRPC->get_transfers([
-                'in' => true,
-                'pool' => true,
-                'subaddr_indices' => [$this->payment_address_index]
-            ]);
+        $minConfirmations = (int) config('monero.order_min_confirmations', 10);
+        $confirmed = '0';
+        $unconfirmed = '0';
 
-            // Calculate minimum accepted payment amount (10% of required amount)
-            $minPaymentPercentage = 0.10; // Could also use a config value like for advertisements
-            $minAcceptedAmount = $this->required_xmr_amount * $minPaymentPercentage;
+        foreach ($wallet->incomingTransfers((int) $this->payment_address_index) as $transfer) {
+            $amount = Xmr::fromAtomic($transfer['amount']);
 
-            $totalReceived = 0;
-            foreach (['in', 'pool'] as $type) {
-                if (isset($transfers[$type])) {
-                    foreach ($transfers[$type] as $transfer) {
-                        // Only count payments that meet the minimum threshold
-                        $amount = $transfer['amount'] / 1e12;
-                        if ($amount >= $minAcceptedAmount) {
-                            $totalReceived += $amount;
-                        }
-                    }
-                }
+            if (!$transfer['in_pool'] && $transfer['confirmations'] >= $minConfirmations) {
+                $confirmed = Xmr::add($confirmed, $amount);
+            } else {
+                $unconfirmed = Xmr::add($unconfirmed, $amount);
+            }
+        }
+
+        return $this->withLock(function (Orders $order) use ($confirmed, $unconfirmed) {
+            $order->total_received_xmr = $confirmed;
+            $order->unconfirmed_received_xmr = $unconfirmed;
+
+            if ($order->status === self::STATUS_WAITING_PAYMENT
+                && $order->required_xmr_amount !== null
+                && Xmr::isPositive($order->required_xmr_amount)
+                && Xmr::cmp($confirmed, $order->required_xmr_amount) >= 0) {
+                $order->status = self::STATUS_PAYMENT_RECEIVED;
+                $order->is_paid = true;
+                $order->paid_at = now();
+                $order->payment_completed_at = now();
             }
 
-            // Update received amount
-            $this->total_received_xmr = $totalReceived;
+            $order->save();
 
-            // Check if payment is completed
-            if ($totalReceived >= $this->required_xmr_amount && !$this->is_paid) {
-                $this->status = self::STATUS_PAYMENT_RECEIVED;
-                $this->is_paid = true;
-                $this->paid_at = now();
-                $this->payment_completed_at = now();
+            if ($order->isFinal()) {
+                $order->settleEscrow();
             }
 
-            $this->save();
             return true;
-        } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error('Error checking order payments: ' . $e->getMessage());
-            return false;
-        }
+        });
     }
 
     /**
@@ -244,108 +304,106 @@ class Orders extends Model
     {
         return $this->expires_at && $this->expires_at->isPast();
     }
-    
+
     /**
-     * Handle expired payment by automatically cancelling the order.
-     * 
-     * @return bool
+     * Cancel the order if its payment window has passed without full payment.
+     *
+     * Call checkPayments() first so a payment that arrived in time is seen.
+     * Orders with unconfirmed incoming funds are not cancelled until those
+     * funds confirm. Confirmed partial payments are refunded.
+     */
+    public function expireIfUnpaid(): bool
+    {
+        return $this->withLock(function (Orders $order) {
+            if ($order->status !== self::STATUS_WAITING_PAYMENT || !$order->isExpired()) {
+                return false;
+            }
+
+            if (Xmr::isPositive($order->unconfirmed_received_xmr)) {
+                return false;
+            }
+
+            $order->cancelLocked();
+
+            return true;
+        });
+    }
+
+    /**
+     * @deprecated Use checkPayments() followed by expireIfUnpaid().
      */
     public function handleExpiredPayment(): bool
     {
-        // Only handle orders in waiting_payment status
-        if ($this->status !== self::STATUS_WAITING_PAYMENT) {
-            return false;
-        }
-        
-        // Check if payment has expired
-        if (!$this->isExpired()) {
-            return false;
-        }
-        
-        // Cancel the order
-        return $this->markAsCancelled();
+        return $this->expireIfUnpaid();
     }
-    
+
+    /*
+    |--------------------------------------------------------------------------
+    | Automatic status changes
+    |--------------------------------------------------------------------------
+    */
+
     /**
      * Check if the order should be auto-cancelled because it hasn't been marked as sent
      * within 96 hours (4 days) of payment being received.
-     * 
-     * @return bool
      */
     public function shouldAutoCancelIfNotSent(): bool
     {
-        // Only handle orders in payment_received status
         if ($this->status !== self::STATUS_PAYMENT_RECEIVED) {
             return false;
         }
-        
-        // Check if 96 hours (4 days) have passed since payment was received
-        if (!$this->paid_at || $this->paid_at->addHours(96)->isFuture()) {
-            return false;
-        }
-        
-        return true;
+
+        return $this->paid_at && !$this->paid_at->copy()->addHours(96)->isFuture();
     }
-    
+
     /**
      * Auto-cancel an order that hasn't been marked as sent within the time limit.
-     * 
-     * @return bool
      */
     public function autoCancelIfNotSent(): bool
     {
-        if (!$this->shouldAutoCancelIfNotSent()) {
-            return false;
-        }
-        
-        // Cancel the order
-        return $this->markAsCancelled();
+        return $this->withLock(function (Orders $order) {
+            if (!$order->shouldAutoCancelIfNotSent()) {
+                return false;
+            }
+
+            $order->cancelLocked();
+
+            return true;
+        });
     }
-    
+
     /**
      * Check if the order should be auto-completed because it hasn't been marked as completed
      * within 192 hours (8 days) of being marked as sent.
-     * 
-     * @return bool
      */
     public function shouldAutoCompleteIfNotConfirmed(): bool
     {
-        // Only handle orders in product_sent status
-        if ($this->status !== self::STATUS_PRODUCT_SENT) {
+        if ($this->status !== self::STATUS_PRODUCT_SENT || $this->is_disputed) {
             return false;
         }
-        
-        // Don't auto-complete if there's an active dispute
-        if ($this->is_disputed || $this->status === self::STATUS_DISPUTED) {
-            return false;
-        }
-        
-        // Check if 192 hours (8 days) have passed since product was marked as sent
-        if (!$this->sent_at || $this->sent_at->addHours(192)->isFuture()) {
-            return false;
-        }
-        
-        return true;
+
+        return $this->sent_at && !$this->sent_at->copy()->addHours(192)->isFuture();
     }
-    
+
     /**
      * Auto-complete an order that hasn't been marked as completed within the time limit.
-     * 
-     * @return bool
      */
     public function autoCompleteIfNotConfirmed(): bool
     {
-        if (!$this->shouldAutoCompleteIfNotConfirmed()) {
-            return false;
-        }
-        
-        // Complete the order
-        return $this->markAsCompleted();
+        return $this->withLock(function (Orders $order) {
+            if (!$order->shouldAutoCompleteIfNotConfirmed()) {
+                return false;
+            }
+
+            $order->completeLocked();
+
+            return true;
+        });
     }
-    
+
     /**
      * Get the time remaining before an order is auto-cancelled if not marked as sent.
-     * 
+     *
      * @return \Illuminate\Support\Carbon|null
      */
     public function getAutoCancelDeadline()
@@ -353,13 +411,13 @@ class Orders extends Model
         if ($this->status !== self::STATUS_PAYMENT_RECEIVED || !$this->paid_at) {
             return null;
         }
-        
-        return $this->paid_at->addHours(96);
+
+        return $this->paid_at->copy()->addHours(96);
     }
-    
+
     /**
      * Get the time remaining before an order is auto-completed if not marked as completed.
-     * 
+     *
      * @return \Illuminate\Support\Carbon|null
      */
     public function getAutoCompleteDeadline()
@@ -367,14 +425,14 @@ class Orders extends Model
         if ($this->status !== self::STATUS_PRODUCT_SENT || !$this->sent_at || $this->is_disputed) {
             return null;
         }
-        
-        return $this->sent_at->addHours(192);
+
+        return $this->sent_at->copy()->addHours(192);
     }
-    
+
     /**
      * Find all orders that need to be auto-cancelled because they haven't been
      * marked as sent within 96 hours of payment received.
-     * 
+     *
      * @return \Illuminate\Database\Eloquent\Collection
      */
     public static function findOrdersToAutoCancel()
@@ -384,11 +442,11 @@ class Orders extends Model
             ->where('paid_at', '<=', now()->subHours(96))
             ->get();
     }
-    
+
     /**
      * Find all orders that need to be auto-completed because they haven't been
      * marked as completed within 192 hours of being marked as sent.
-     * 
+     *
      * @return \Illuminate\Database\Eloquent\Collection
      */
     public static function findOrdersToAutoComplete()
@@ -399,33 +457,31 @@ class Orders extends Model
             ->where('sent_at', '<=', now()->subHours(192))
             ->get();
     }
-    
+
     /**
      * Process all orders that need auto status changes.
-     * 
+     *
+     * Runs from the escrow:process scheduled command, not on page views.
+     *
      * @return array Array containing counts of cancelled and completed orders
      */
     public static function processAllAutoStatusChanges()
     {
         $cancelCount = 0;
         $completeCount = 0;
-        
-        // Process auto-cancellations
-        $ordersToCancel = self::findOrdersToAutoCancel();
-        foreach ($ordersToCancel as $order) {
+
+        foreach (self::findOrdersToAutoCancel() as $order) {
             if ($order->autoCancelIfNotSent()) {
                 $cancelCount++;
             }
         }
-        
-        // Process auto-completions
-        $ordersToComplete = self::findOrdersToAutoComplete();
-        foreach ($ordersToComplete as $order) {
+
+        foreach (self::findOrdersToAutoComplete() as $order) {
             if ($order->autoCompleteIfNotConfirmed()) {
                 $completeCount++;
             }
         }
-        
+
         return [
             'cancelled' => $cancelCount,
             'completed' => $completeCount
@@ -435,16 +491,58 @@ class Orders extends Model
     /**
      * Calculate required XMR amount based on USD price and current XMR rate.
      *
-     * @param float $xmrUsdRate
-     * @return float
+     * @param  string|float  $xmrUsdRate
      */
-    public function calculateRequiredXmrAmount($xmrUsdRate)
+    public function calculateRequiredXmrAmount($xmrUsdRate): string
     {
-        if ($xmrUsdRate <= 0) {
+        if (!is_numeric($xmrUsdRate) || $xmrUsdRate <= 0) {
             throw new \InvalidArgumentException('XMR rate must be greater than zero');
         }
-        
-        return $this->total / $xmrUsdRate;
+
+        return bcdiv((string) $this->total, Xmr::of($xmrUsdRate), Xmr::SCALE);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Status transitions
+    |--------------------------------------------------------------------------
+    */
+
+    /** Whether the order reached a final status. */
+    public function isFinal(): bool
+    {
+        return in_array($this->status, [self::STATUS_COMPLETED, self::STATUS_CANCELLED], true);
+    }
+
+    /**
+     * Whether $userId may cancel the order in its current status.
+     *
+     * - The buyer may cancel only before the vendor ships.
+     * - The vendor may cancel until the order completes (the buyer is refunded).
+     * - Nobody may cancel a disputed order; an admin resolves the dispute.
+     */
+    public function canBeCancelledBy(?string $userId): bool
+    {
+        if ($userId === null) {
+            return false;
+        }
+
+        if ($userId === $this->user_id) {
+            return in_array($this->status, [
+                self::STATUS_WAITING_PAYMENT,
+                self::STATUS_PAYMENT_RECEIVED,
+            ], true);
+        }
+
+        if ($userId === $this->vendor_id) {
+            return in_array($this->status, [
+                self::STATUS_WAITING_PAYMENT,
+                self::STATUS_PAYMENT_RECEIVED,
+                self::STATUS_PRODUCT_SENT,
+            ], true);
+        }
+
+        return false;
     }
 
     /**
@@ -452,16 +550,18 @@ class Orders extends Model
      */
     public function markAsPaid()
     {
-        if ($this->status !== self::STATUS_WAITING_PAYMENT) {
-            return false;
-        }
+        return $this->withLock(function (Orders $order) {
+            if ($order->status !== self::STATUS_WAITING_PAYMENT) {
+                return false;
+            }
 
-        $this->status = self::STATUS_PAYMENT_RECEIVED;
-        $this->is_paid = true;
-        $this->paid_at = now();
-        $this->save();
+            $order->status = self::STATUS_PAYMENT_RECEIVED;
+            $order->is_paid = true;
+            $order->paid_at = now();
+            $order->save();
 
-        return true;
+            return true;
+        });
     }
 
     /**
@@ -469,269 +569,243 @@ class Orders extends Model
      */
     public function markAsSent()
     {
-        if ($this->status !== self::STATUS_PAYMENT_RECEIVED) {
-            return false;
-        }
+        return $this->withLock(function (Orders $order) {
+            if ($order->status !== self::STATUS_PAYMENT_RECEIVED) {
+                return false;
+            }
 
-        $this->status = self::STATUS_PRODUCT_SENT;
-        $this->is_sent = true;
-        $this->sent_at = now();
-        $this->save();
+            $order->status = self::STATUS_PRODUCT_SENT;
+            $order->is_sent = true;
+            $order->sent_at = now();
+            $order->save();
 
-        return true;
+            return true;
+        });
     }
 
     /**
-     * Mark the order as completed.
+     * Mark the order as completed and schedule the vendor payout.
+     *
+     * A disputed order can only be completed by resolving the dispute.
      */
-    public function markAsCompleted()
+    public function markAsCompleted(bool $resolvingDispute = false)
     {
-        if ($this->status !== self::STATUS_PRODUCT_SENT && $this->status !== self::STATUS_DISPUTED) {
-            return false;
-        }
+        return $this->withLock(function (Orders $order) use ($resolvingDispute) {
+            $allowed = $resolvingDispute ? self::STATUS_DISPUTED : self::STATUS_PRODUCT_SENT;
 
-        // Store current status before changing it
-        $currentStatus = $this->status;
-        
+            if ($order->status !== $allowed) {
+                return false;
+            }
+
+            $order->completeLocked();
+
+            return true;
+        });
+    }
+
+    /**
+     * Cancel the order on behalf of the buyer or the vendor.
+     *
+     * The permission check runs on the locked row, so a vendor marking the
+     * order as sent at the same moment cannot let the buyer cancel a shipped
+     * order.
+     */
+    public function cancelBy(?string $userId): bool
+    {
+        return $this->withLock(function (Orders $order) use ($userId) {
+            if (!$order->canBeCancelledBy($userId)) {
+                return false;
+            }
+
+            $order->cancelLocked();
+
+            return true;
+        });
+    }
+
+    /**
+     * Mark the order as cancelled and refund what the buyer paid.
+     *
+     * Without $resolvingDispute only undisputed, unfinished orders can be
+     * cancelled. Prefer cancelBy() for user actions.
+     */
+    public function markAsCancelled(bool $resolvingDispute = false)
+    {
+        return $this->withLock(function (Orders $order) use ($resolvingDispute) {
+            $allowed = $resolvingDispute
+                ? [self::STATUS_DISPUTED]
+                : [self::STATUS_WAITING_PAYMENT, self::STATUS_PAYMENT_RECEIVED, self::STATUS_PRODUCT_SENT];
+
+            if (!in_array($order->status, $allowed, true)) {
+                return false;
+            }
+
+            $order->cancelLocked();
+
+            return true;
+        });
+    }
+
+    /**
+     * Complete a locked order: update status, reduce stock, schedule payout.
+     */
+    protected function completeLocked(): void
+    {
         $this->status = self::STATUS_COMPLETED;
         $this->is_completed = true;
         $this->completed_at = now();
-        
-        // If this was a disputed order, reset the disputed flag
-        if ($currentStatus === self::STATUS_DISPUTED) {
-            $this->is_disputed = false;
-        }
-        
+        $this->is_disputed = false;
         $this->save();
 
-        // Reduce stock for all products in this order
-        foreach ($this->items as $item) {
-            $product = $item->product;
-            if (!$product) {
-                continue;
-            }
-            
-            // Calculate actual quantity based on bulk options
-            $actualQuantity = $item->quantity;
+        foreach ($this->items()->get() as $item) {
+            $quantity = $item->quantity;
             if ($item->bulk_option && isset($item->bulk_option['amount'])) {
-                $actualQuantity = $item->quantity * $item->bulk_option['amount'];
+                $quantity = $item->quantity * $item->bulk_option['amount'];
             }
-            
-            // Only reduce stock if there's enough available
-            if ($product->stock_amount >= $actualQuantity) {
-                $product->stock_amount -= $actualQuantity;
-                $product->save();
-            }
+
+            // Atomic decrement that never goes below zero.
+            Product::whereKey($item->product_id)
+                ->where('stock_amount', '>=', $quantity)
+                ->decrement('stock_amount', $quantity);
         }
 
-        // Process automatic payment to vendor
-        $this->processVendorPayment();
+        $this->settleEscrow();
+    }
+
+    /**
+     * Cancel a locked order and schedule the buyer refund.
+     */
+    protected function cancelLocked(): void
+    {
+        $this->status = self::STATUS_CANCELLED;
+        $this->cancelled_at = now();
+        $this->is_disputed = false;
+        $this->save();
+
+        $this->settleEscrow();
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Escrow settlement
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * Schedule transfers for every confirmed XMR of a finished order that no
+     * transfer covers yet. Must run on a locked order.
+     *
+     * - Completed: the vendor gets the order price minus the marketplace
+     *   commission, once. Anything paid on top of the price (overpayment, a
+     *   late payment) is refunded to the buyer in full.
+     * - Cancelled: the buyer gets everything back minus the cancellation
+     *   commission (monero.cancelled_order_commission_percentage).
+     *
+     * Running it again creates nothing new unless more money arrived.
+     */
+    public function settleEscrow(): void
+    {
+        if (!$this->isFinal()) {
+            return;
+        }
+
+        $covered = Xmr::of(
+            $this->escrowTransfers()->sum('gross_amount_xmr')
+        );
+        $uncovered = Xmr::sub($this->total_received_xmr, $covered);
+
+        if (!Xmr::isPositive($uncovered)) {
+            return;
+        }
+
+        if ($this->status === self::STATUS_COMPLETED) {
+            $hasPayout = $this->escrowTransfers()
+                ->where('type', EscrowTransfer::TYPE_VENDOR_PAYOUT)
+                ->exists();
+
+            if (!$hasPayout) {
+                $price = Xmr::of($this->required_xmr_amount ?? $uncovered);
+                $gross = Xmr::cmp($uncovered, $price) > 0 ? $price : $uncovered;
+
+                // The buyer paid subtotal + commission; the vendor's share is subtotal / total.
+                $net = Xmr::of(bcdiv(
+                    bcmul($gross, (string) $this->subtotal, Xmr::SCALE + 4),
+                    (string) $this->total,
+                    Xmr::SCALE
+                ));
+
+                $this->scheduleTransfer(EscrowTransfer::TYPE_VENDOR_PAYOUT, $this->vendor_id, $gross, $net);
+                $uncovered = Xmr::sub($uncovered, $gross);
+            }
+
+            // Overpayment or late payment: give it back without commission.
+            if (Xmr::cmp($uncovered, (string) config('monero.refund_dust_threshold', '0.0005')) >= 0) {
+                $this->scheduleTransfer(EscrowTransfer::TYPE_BUYER_REFUND, $this->user_id, $uncovered, $uncovered);
+            }
+
+            return;
+        }
+
+        // Cancelled
+        if (Xmr::cmp($uncovered, (string) config('monero.refund_dust_threshold', '0.0005')) < 0) {
+            return;
+        }
+
+        $commissionPercentage = (string) config('monero.cancelled_order_commission_percentage', 1.0);
+        $keep = bcdiv(bcmul($uncovered, $commissionPercentage, Xmr::SCALE + 4), '100', Xmr::SCALE);
+        $net = Xmr::sub($uncovered, $keep);
+
+        $this->scheduleTransfer(EscrowTransfer::TYPE_BUYER_REFUND, $this->user_id, $uncovered, $net);
+    }
+
+    /**
+     * Record a transfer to be sent by the escrow processor.
+     */
+    protected function scheduleTransfer(string $type, string $recipientId, string $gross, string $net): EscrowTransfer
+    {
+        $address = ReturnAddress::where('user_id', $recipientId)->inRandomOrder()->value('monero_address');
+
+        $transfer = $this->escrowTransfers()->create([
+            'type' => $type,
+            'recipient_id' => $recipientId,
+            'gross_amount_xmr' => $gross,
+            'amount_xmr' => $net,
+            'address' => $address,
+            'status' => $address ? EscrowTransfer::STATUS_PENDING : EscrowTransfer::STATUS_AWAITING_ADDRESS,
+            'last_error' => $address ? null : 'Recipient has no return address.',
+        ]);
+
+        Log::info('Escrow transfer scheduled', [
+            'order' => $this->id,
+            'transfer' => $transfer->id,
+            'type' => $type,
+            'amount' => $net,
+        ]);
+
+        return $transfer;
+    }
+
+    /**
+     * @deprecated Payouts are scheduled by markAsCompleted() and sent by the
+     *             escrow:process command. Kept for old queued jobs.
+     */
+    public function processVendorPayment()
+    {
+        if ($this->status === self::STATUS_COMPLETED) {
+            $this->withLock(fn (Orders $order) => $order->settleEscrow());
+        }
 
         return true;
     }
 
     /**
-     * Process automatic payment to vendor when order is completed.
-     * 
-     * @return bool
-     */
-   public function processVendorPayment()
-{
-    if (!$this->total_received_xmr || $this->total_received_xmr <= 0) {
-        \Log::error("Order {$this->id} has no received XMR");
-        return false;
-    }
-
-    try {
-        $commissionRatio = $this->commission / $this->subtotal;
-        $vendorPaymentAmount = $this->total_received_xmr * (1 - $commissionRatio);
-
-        $vendor = $this->vendor;
-        if (!$vendor) {
-            \Log::error("Order {$this->id} has no vendor");
-            return false;
-        }
-
-        $returnAddress = $vendor->returnAddresses()->inRandomOrder()->first();
-        if (!$returnAddress) {
-            \Log::error("Vendor {$vendor->id} has no return addresses");
-            return false;
-        }
-
-        $config = config('monero');
-        $walletRPC = new \MoneroIntegrations\MoneroPhp\walletRPC(
-            $config['host'],
-            $config['port'],
-            $config['ssl'],
-            30000
-        );
-
-        // Add 1% fee buffer
-        $feeBuffer = 0.01;
-        $maxRetries = 3;
-        $retryDelay = 5; // seconds
-
-        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
-            try {
-                $balance = $walletRPC->get_balance();
-                $unlockedBalance = $balance['unlocked_balance'] / 1e12;
-                
-                // Check if sufficient balance exists (amount + buffer)
-                if ($unlockedBalance < ($vendorPaymentAmount + $feeBuffer)) {
-                    \Log::warning("Insufficient balance. Required: " 
-                        . ($vendorPaymentAmount + $feeBuffer) 
-                        . " XMR, Available: $unlockedBalance XMR");
-                    
-                    // Try partial payment if possible
-                    if ($unlockedBalance > $feeBuffer) {
-                        $vendorPaymentAmount = $unlockedBalance - $feeBuffer;
-                        \Log::info("Attempting partial payment: $vendorPaymentAmount XMR");
-                    } else {
-                        throw new \Exception("Insufficient funds even for partial payment");
-                    }
-                }
-
-                $result = $walletRPC->transfer([
-                    'address' => $returnAddress->monero_address,
-                    'amount' => $vendorPaymentAmount,
-                    'priority' => 1
-                ]);
-
-                // Log success and update order
-                \Log::info("Vendor payment successful", [
-                    'order' => $this->id,
-                    'amount' => $vendorPaymentAmount,
-                    'address' => $returnAddress->monero_address
-                ]);
-
-                $this->update([
-                    'vendor_payment_amount' => $vendorPaymentAmount,
-                    'vendor_payment_address' => $returnAddress->monero_address,
-                    'vendor_payment_at' => now()
-                ]);
-
-                return true;
-            } catch (\Exception $e) {
-                \Log::error("Payment attempt $attempt failed: " . $e->getMessage());
-                
-                if ($attempt < $maxRetries) {
-                    sleep($retryDelay);
-                    // Refresh balance before retry
-                    $balance = $walletRPC->get_balance();
-                } else {
-                    // Queue for later processing if final attempt fails
-                    \App\Jobs\ProcessVendorPayment::dispatch($this)
-                        ->delay(now()->addMinutes(30));
-                    
-                    \Log::info("Payment queued for order {$this->id}");
-                }
-            }
-        }
-        
-        return false;
-    } catch (\Exception $e) {
-        \Log::error("Payment processing failed: " . $e->getMessage());
-        return false;
-    }
-}
-
-    /**
-     * Process automatic refund to buyer when an order is cancelled.
-     * 
-     * @return bool
+     * @deprecated Refunds are scheduled by markAsCancelled() and sent by the
+     *             escrow:process command.
      */
     public function processBuyerRefund()
     {
-        // Only process refund if we have received Monero for this order
-        if (!$this->total_received_xmr || $this->total_received_xmr <= 0) {
-            \Illuminate\Support\Facades\Log::info("Order {$this->id} has no received XMR to refund to buyer");
-            return false;
-        }
-        
-        try {
-            // Get the commission percentage for cancelled orders
-            $commissionPercentage = config('monero.cancelled_order_commission_percentage', 1.0);
-            
-            // Calculate buyer refund amount (total received minus commission)
-            $buyerRefundAmount = $this->total_received_xmr * (1 - ($commissionPercentage / 100));
-            
-            // Get buyer
-            $buyer = $this->user;
-            if (!$buyer) {
-                \Illuminate\Support\Facades\Log::error("Order {$this->id} has no associated buyer");
-                return false;
-            }
-            
-            // Get a random return address for the buyer
-            $returnAddress = $buyer->returnAddresses()->inRandomOrder()->first();
-            if (!$returnAddress) {
-                \Illuminate\Support\Facades\Log::error("Buyer {$buyer->id} has no return addresses for refund");
-                return false;
-            }
-            
-            // Initialize Monero wallet RPC
-            $config = config('monero');
-            $walletRPC = new \MoneroIntegrations\MoneroPhp\walletRPC(
-                $config['host'],
-                $config['port'],
-                $config['ssl'],
-                30000  // 30 second timeout
-            );
-            
-            // Process refund to buyer
-            $result = $walletRPC->transfer([
-                'address' => $returnAddress->monero_address,
-                'amount' => $buyerRefundAmount,
-                'priority' => 1
-            ]);
-            
-            // Log successful refund
-            \Illuminate\Support\Facades\Log::info("Buyer refund processed: Order {$this->id}, Amount: {$buyerRefundAmount} XMR, Address: {$returnAddress->monero_address}");
-            
-            // Update order with refund details
-            $this->buyer_refund_amount = $buyerRefundAmount;
-            $this->buyer_refund_address = $returnAddress->monero_address;
-            $this->buyer_refund_at = now();
-            $this->save();
-            
-            return true;
-        } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::error("Error processing buyer refund for order {$this->id}: " . $e->getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Mark the order as cancelled.
-     */
-    public function markAsCancelled()
-    {
-        // Only allow cancellation for orders that aren't completed
-        if ($this->status === self::STATUS_COMPLETED) {
-            return false;
-        }
-
-        // Store current status before changing it
-        $currentStatus = $this->status;
-        
-        $this->status = self::STATUS_CANCELLED;
-        
-        // If this was a disputed order, reset the disputed flag
-        if ($currentStatus === self::STATUS_DISPUTED) {
-            $this->is_disputed = false;
-        }
-        
-        $this->save();
-        
-        // Process refund to buyer based on the order status
-        if ($currentStatus === self::STATUS_WAITING_PAYMENT) {
-            // No refund needed as the user hasn't paid
-            return true;
-        } elseif ($currentStatus === self::STATUS_PAYMENT_RECEIVED || 
-                  $currentStatus === self::STATUS_PRODUCT_SENT || 
-                  $currentStatus === self::STATUS_DISPUTED) {
-            // Process refund for orders that have been paid for
-            $this->processBuyerRefund();
+        if ($this->status === self::STATUS_CANCELLED) {
+            $this->withLock(fn (Orders $order) => $order->settleEscrow());
         }
 
         return true;
@@ -755,29 +829,31 @@ class Orders extends Model
     
     /**
      * Open a dispute for the order.
+     *
+     * @return Dispute|false
      */
     public function openDispute($reason)
     {
-        // Only allow disputes for orders in "product sent" status
-        if ($this->status !== self::STATUS_PRODUCT_SENT) {
-            return false;
-        }
+        return $this->withLock(function (Orders $order) use ($reason) {
+            // Only allow disputes for orders in "product sent" status
+            if ($order->status !== self::STATUS_PRODUCT_SENT) {
+                return false;
+            }
 
-        // Update order status
-        $this->status = self::STATUS_DISPUTED;
-        $this->is_disputed = true;
-        $this->disputed_at = now();
-        $this->save();
+            $order->status = self::STATUS_DISPUTED;
+            $order->is_disputed = true;
+            $order->disputed_at = now();
+            $order->save();
 
-        // Create dispute record
-        $dispute = new Dispute([
-            'order_id' => $this->id,
-            'status' => Dispute::STATUS_ACTIVE,
-            'reason' => $reason
-        ]);
-        $dispute->save();
+            $dispute = new Dispute([
+                'order_id' => $order->id,
+                'status' => Dispute::STATUS_ACTIVE,
+                'reason' => $reason
+            ]);
+            $dispute->save();
 
-        return $dispute;
+            return $dispute;
+        });
     }
 
     /**
