@@ -2,6 +2,8 @@
 
 namespace App\Providers;
 
+use App\Services\Monero\MoneroWallet;
+use App\Services\Monero\RpcMoneroWallet;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Pagination\Paginator;
 use Carbon\Carbon;
@@ -14,7 +16,17 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        $this->app->singleton(MoneroWallet::class, function () {
+            $config = config('monero');
+
+            return new RpcMoneroWallet(
+                (string) $config['host'],
+                (int) $config['port'],
+                (bool) $config['ssl'],
+                $config['user'] ?? null,
+                $config['password'] ?? null,
+            );
+        });
     }
 
     /**

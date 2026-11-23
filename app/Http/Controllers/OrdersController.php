@@ -8,7 +8,7 @@ use App\Models\Dispute;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use App\Http\Controllers\XmrPriceController;
-use MoneroIntegrations\MoneroPhp\walletRPC;
+use App\Services\Monero\MoneroWallet;
 use Endroid\QrCode\Builder\Builder;
 use Endroid\QrCode\Encoding\Encoding;
 use Endroid\QrCode\ErrorCorrectionLevel;
@@ -17,24 +17,10 @@ use Illuminate\Support\Facades\Log;
 
 class OrdersController extends Controller
 {
-    protected $walletRPC;
-    
-    /**
-     * Create a new controller instance.
-     */
-    public function __construct()
+    public function __construct(private MoneroWallet $wallet)
     {
-        $config = config('monero');
-        try {
-            $this->walletRPC = new walletRPC(
-                $config['host'],
-                $config['port'],
-                $config['ssl']
-            );
-        } catch (\Exception $e) {
-            Log::error('Failed to initialize Monero RPC connection: ' . $e->getMessage());
-        }
     }
+
     /**
      * Display a listing of the user's orders.
      */
@@ -52,9 +38,6 @@ class OrdersController extends Controller
      */
     public function show($uniqueUrl)
     {
-        // Process any orders that need auto status changes
-        Orders::processAllAutoStatusChanges();
-        
         $order = Orders::findByUrl($uniqueUrl);
         
         if (!$order) {
@@ -69,85 +52,40 @@ class OrdersController extends Controller
         // Determine if the current user is the buyer or vendor
         $isBuyer = $order->user_id === Auth::id();
 
-        // For buyers with unpaid orders, check if a payment address exists
-        // and handle payment processing
+        // Payments, expiry and automatic status changes are handled by the
+        // escrow:process scheduled command. The buyer's payment page also
+        // checks this order right away so a payment shows up without waiting.
         $qrCode = null;
         if ($isBuyer && $order->status === Orders::STATUS_WAITING_PAYMENT) {
-            // First check if the order has an expired payment
-            if ($order->isExpired() && !empty($order->payment_address)) {
-                // Handle expired payment (cancels the order)
-                $order->handleExpiredPayment();
-                
-                // Refresh the order after cancellation
-                $order->refresh();
-                
-                if ($order->status === Orders::STATUS_CANCELLED) {
-                    return redirect()->route('orders.show', $order->unique_url)
-                        ->with('info', 'This order has been automatically cancelled because the payment window has expired.');
+            if (empty($order->payment_address)) {
+                $xmrRate = (new XmrPriceController())->getXmrPrice();
+
+                if ($xmrRate === 'UNAVAILABLE') {
+                    return redirect()->back()->with('error', 'Unable to get XMR price. Please try again later.');
+                }
+
+                if (!$order->generatePaymentAddress($this->wallet, $xmrRate)) {
+                    return redirect()->back()->with('error', 'Unable to generate payment address. Please try again.');
                 }
             }
-            
-            // Check if the order should be auto-cancelled (not sent within 96 hours)
-            if ($order->shouldAutoCancelIfNotSent()) {
-                $order->autoCancelIfNotSent();
-                $order->refresh();
-                
-                if ($order->status === Orders::STATUS_CANCELLED) {
-                    return redirect()->route('orders.show', $order->unique_url)
-                        ->with('info', 'This order has been automatically cancelled because the vendor did not mark it as sent within 96 hours (4 days) after payment.');
-                }
-            }
-            
-            // Check if the order should be auto-completed (not marked completed within 192 hours after being sent)
-            if ($order->shouldAutoCompleteIfNotConfirmed()) {
-                $order->autoCompleteIfNotConfirmed();
-                $order->refresh();
-                
-                if ($order->status === Orders::STATUS_COMPLETED) {
-                    return redirect()->route('orders.show', $order->unique_url)
-                        ->with('info', 'This order has been automatically marked as completed because it was not confirmed within 192 hours (8 days) after being marked as sent.');
-                }
-            }
-            
-            // Only generate a payment address if none exists and the order isn't cancelled
-            if (empty($order->payment_address) && $order->status === Orders::STATUS_WAITING_PAYMENT) {
-                try {
-                    // Get current XMR/USD rate
-                    $xmrPriceController = new XmrPriceController();
-                    $xmrRate = $xmrPriceController->getXmrPrice();
-                    
-                    if ($xmrRate === 'UNAVAILABLE') {
-                        return redirect()->back()->with('error', 'Unable to get XMR price. Please try again later.');
-                    }
-                    
-                    // Calculate required XMR amount
-                    $requiredXmrAmount = $order->calculateRequiredXmrAmount($xmrRate);
-                    
-                    // Update order with XMR details
-                    $order->required_xmr_amount = $requiredXmrAmount;
-                    $order->xmr_usd_rate = $xmrRate;
-                    $order->save();
-                    
-                    // Generate payment address
-                    if (!$order->generatePaymentAddress($this->walletRPC)) {
-                        return redirect()->back()->with('error', 'Unable to generate payment address. Please try again.');
-                    }
-                } catch (\Exception $e) {
-                    Log::error('Error setting up payment: ' . $e->getMessage());
-                    return redirect()->back()->with('error', 'Error setting up payment: ' . $e->getMessage());
-                }
-            }
-            
-            // Check for new payments
+
+            // Look for payments before checking the expiry, so a payment made
+            // in time is never cancelled.
             try {
-                $order->checkPayments($this->walletRPC);
+                $order->checkPayments($this->wallet);
             } catch (\Exception $e) {
                 Log::error('Error checking payments: ' . $e->getMessage());
             }
-            
-            // Refresh order data after potential updates
-            $order->refresh();
-            
+
+            if ($order->expireIfUnpaid()) {
+                $message = 'This order has been automatically cancelled because the payment window has expired.';
+                if (\App\Support\Xmr::isPositive($order->total_received_xmr)) {
+                    $message .= ' The amount you paid will be refunded to one of your return addresses.';
+                }
+
+                return redirect()->route('orders.show', $order->unique_url)->with('info', $message);
+            }
+
             // Generate QR code if payment is not completed
             if (!$order->is_paid && $order->payment_address) {
                 try {
@@ -301,7 +239,7 @@ class OrdersController extends Controller
 
         if ($order->markAsCompleted()) {
             return redirect()->route('orders.show', $order->unique_url)
-                ->with('success', 'Order marked as completed and payment has been sent to the vendor. Thank you for your purchase.');
+                ->with('success', 'Order marked as completed. The payment to the vendor has been scheduled. Thank you for your purchase.');
         }
 
         return redirect()->route('orders.show', $order->unique_url)
@@ -324,18 +262,22 @@ class OrdersController extends Controller
             abort(403, 'Unauthorized action.');
         }
 
-        // Check if order is in a status that can be cancelled
-        if ($order->status === Orders::STATUS_COMPLETED) {
-            return redirect()->back()->with('error', 'Completed orders cannot be cancelled.');
-        }
-
-        if ($order->markAsCancelled()) {
+        // The permission check runs again on the locked order inside cancelBy().
+        if ($order->cancelBy(Auth::id())) {
             // Determine the redirect route based on whether the user is buyer or vendor
             $isBuyer = $order->user_id === Auth::id();
             $route = $isBuyer ? 'orders.show' : 'vendor.sales.show';
             
             return redirect()->route($route, $order->unique_url)
                 ->with('success', 'Order has been cancelled successfully.');
+        }
+
+        if ($order->status === Orders::STATUS_DISPUTED) {
+            return redirect()->back()->with('error', 'Disputed orders cannot be cancelled. An administrator will resolve the dispute.');
+        }
+
+        if ($order->user_id === Auth::id() && $order->status === Orders::STATUS_PRODUCT_SENT) {
+            return redirect()->back()->with('error', 'The vendor has already sent this order. Open a dispute if there is a problem with it.');
         }
 
         return redirect()->back()->with('error', 'Unable to cancel the order at this time.');

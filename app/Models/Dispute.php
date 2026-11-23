@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 class Dispute extends Model
@@ -94,43 +95,59 @@ class Dispute extends Model
     }
 
     /**
-     * Resolve the dispute with vendor prevailing.
+     * Resolve the dispute with vendor prevailing: complete the order and pay
+     * the vendor.
      */
     public function resolveVendorPrevails($adminId)
     {
-        if ($this->status !== self::STATUS_ACTIVE) {
-            return false;
-        }
-
-        $this->status = self::STATUS_VENDOR_PREVAILS;
-        $this->resolved_at = now();
-        $this->resolved_by = $adminId;
-        $this->save();
-
-        // Mark the order as completed
-        $this->order->markAsCompleted();
-
-        return true;
+        return $this->resolve(self::STATUS_VENDOR_PREVAILS, $adminId);
     }
 
     /**
-     * Resolve the dispute with buyer prevailing.
+     * Resolve the dispute with buyer prevailing: cancel the order and refund
+     * the buyer.
      */
     public function resolveBuyerPrevails($adminId)
     {
-        if ($this->status !== self::STATUS_ACTIVE) {
-            return false;
-        }
+        return $this->resolve(self::STATUS_BUYER_PREVAILS, $adminId);
+    }
 
-        $this->status = self::STATUS_BUYER_PREVAILS;
-        $this->resolved_at = now();
-        $this->resolved_by = $adminId;
-        $this->save();
+    /**
+     * Resolve the dispute and settle its order in one transaction.
+     *
+     * The dispute is only marked resolved when the order was still disputed
+     * and its status change succeeded, so a dispute can never be closed
+     * without moving the money.
+     */
+    protected function resolve(string $outcome, $adminId): bool
+    {
+        $resolved = DB::transaction(function () use ($outcome, $adminId) {
+            $dispute = static::whereKey($this->getKey())->lockForUpdate()->first();
 
-        // Mark the order as cancelled
-        $this->order->markAsCancelled();
+            if (!$dispute || $dispute->status !== self::STATUS_ACTIVE) {
+                return false;
+            }
 
-        return true;
+            $order = $dispute->order;
+            $settled = $outcome === self::STATUS_VENDOR_PREVAILS
+                ? $order->markAsCompleted(resolvingDispute: true)
+                : $order->markAsCancelled(resolvingDispute: true);
+
+            if (!$settled) {
+                return false;
+            }
+
+            $dispute->status = $outcome;
+            $dispute->resolved_at = now();
+            $dispute->resolved_by = $adminId;
+            $dispute->save();
+
+            return true;
+        });
+
+        $this->refresh();
+
+        return $resolved;
     }
 
     /**
